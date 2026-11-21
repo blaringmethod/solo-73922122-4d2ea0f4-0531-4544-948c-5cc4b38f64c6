@@ -39,6 +39,7 @@ import csv
 import io
 import math
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -100,10 +101,24 @@ class Dataset:
     months: set[str] = field(default_factory=set)
     # 解析阶段的非致命提示（如重复行）
     warnings: list[str] = field(default_factory=list)
+    # 已下架版次（源行仍保留，仅不再参与判定与通路计算）
+    retired_versions: set[str] = field(default_factory=set)
+    # 已登记的保护月对，元素为按月份升序排列的二元组
+    protected_pairs: list[tuple[str, str]] = field(default_factory=list)
+    # 状态修订号：在架版次或已登记月对每次变化时 +1，用于试算确认的乐观锁
+    revision: int = 0
+    # 试算方案：simulation_id -> Simulation（演示用量，保存在进程内）
+    simulations: dict[str, "Simulation"] = field(default_factory=dict)
 
     @property
     def versions(self) -> list[str]:
+        """全部版次（含已下架），用于源行查询。"""
         return sorted(self.version_records.keys())
+
+    @property
+    def active_versions(self) -> list[str]:
+        """在架版次：可参与判定，也可作为下架候选。"""
+        return [v for v in self.versions if v not in self.retired_versions]
 
 
 class CSVParseError(ValueError):
@@ -481,9 +496,10 @@ def analyze(
     """执行涨跌判定。
 
     仅使用勾选版次的记录，并要求这些记录与起、止两月在同一连通分量内
-    （“与两月相连的全部换基记录”）。
+    （“与两月相连的全部换基记录”）。已下架版次即使出现在勾选列表中
+    也不提供任何记录。
     """
-    selected = set(selected_versions)
+    selected = set(selected_versions) - dataset.retired_versions
     used = [r for r in dataset.records if r.version in selected]
     versions_sorted = sorted(selected)
 
@@ -606,3 +622,290 @@ def _component_nodes(edges: list[Edge], start: str) -> set[str]:
                 seen.add(nxt)
                 stack.append(nxt)
     return seen
+
+
+# --------------------------------------------------------------------------- #
+# 下架试算
+# --------------------------------------------------------------------------- #
+#
+# 数据员拟下架若干旧版次，同时要求一批“保护月对”在换基后仍可比较。
+# 试算只读、不修改数据集：
+# * 以“当前在架版次 − 拟下架版次”的全部源行重建通路；
+# * 对每个保护月对检查是否仍有相连的换基记录（可经过任意中间月份）；
+# * 对仍连通的月对，逐个尝试“整版源行缺失”，找出会使它断开的版号。
+#
+# 确认时才一次性写入：登记新月对并停用所选版次。任何校验失败都不产生
+# 部分修改，现有供数保持不变。
+
+PAIR_SOURCE_REGISTERED = "registered"
+PAIR_SOURCE_DRAFT = "draft"
+
+
+def normalize_month(month: str) -> str:
+    """校验并返回规范化的 ``YYYY-MM`` 月份。"""
+    if not isinstance(month, str) or not MONTH_RE.match(month):
+        raise ValueError(f"月份格式应为 YYYY-MM：{month!r}")
+    return month
+
+
+def normalize_pair(start_month: str, end_month: str) -> tuple[str, str]:
+    """校验月对并返回按月份升序排列的二元组（月对本身无方向）。"""
+    start = normalize_month(start_month)
+    end = normalize_month(end_month)
+    if start == end:
+        raise ValueError(f"月对的两个月份必须不同：{start}")
+    return (start, end) if start < end else (end, start)
+
+
+def _active_records(dataset: Dataset, extra_retired: set[str] | None = None) -> list[Record]:
+    retired = set(dataset.retired_versions)
+    if extra_retired:
+        retired |= extra_retired
+    return [r for r in dataset.records if r.version not in retired]
+
+
+def _path_edges(edges: list[Edge], start: str, target: str,
+                banned_versions: set[str] | None = None) -> Optional[list[Edge]]:
+    """无向 BFS 找一条 start -> target 的通路，可按版号整版排除。"""
+    if start == target:
+        return []
+    banned = banned_versions or set()
+    adj: dict[str, list[tuple[str, Edge]]] = {}
+    for e in edges:
+        if e.record.version in banned:
+            continue
+        adj.setdefault(e.u, []).append((e.v, e))
+        adj.setdefault(e.v, []).append((e.u, e))
+    if start not in adj:
+        return None
+    prev: dict[str, tuple[str, Edge]] = {}
+    seen = {start}
+    queue = [start]
+    head = 0
+    while head < len(queue):
+        cur = queue[head]
+        head += 1
+        for nxt, edge in adj.get(cur, []):
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            prev[nxt] = (cur, edge)
+            if nxt == target:
+                path: list[Edge] = []
+                node = target
+                while node != start:
+                    parent, used = prev[node]
+                    path.append(used)
+                    node = parent
+                path.reverse()
+                return path
+            queue.append(nxt)
+    return None
+
+
+def _connected(edges: list[Edge], start: str, target: str) -> bool:
+    return _path_edges(edges, start, target) is not None
+
+
+def _path_hops(path: list[Edge], start: str) -> list[dict]:
+    """把边序列转成按行走方向的月份跳转，供页面展示备用通路。"""
+    hops: list[dict] = []
+    cur = start
+    for edge in path:
+        nxt = edge.v if edge.u == cur else edge.u
+        hops.append({
+            "from_month": cur,
+            "to_month": nxt,
+            "version": edge.record.version,
+            "row_no": edge.record.row_no,
+        })
+        cur = nxt
+    return hops
+
+
+@dataclass
+class PairCheck:
+    """一个保护月对在下架方案下的通路检查结果。"""
+
+    start_month: str
+    end_month: str
+    source: str  # registered：此前已登记；draft：本次新填
+    was_connected: bool
+    connected: bool
+    disconnected_immediately: bool
+    # 整版源行一旦缺失就会使该月对断开的版号（仅对仍连通的月对计算）
+    bridge_versions: list[str] = field(default_factory=list)
+    # 每个 bridge_version 对应的替代通路（排除该版后的通路）
+    alternate_paths: dict[str, list[dict]] = field(default_factory=dict)
+    # 当前方案下的一条可行通路（若仍连通）
+    path: list[dict] = field(default_factory=list)
+    message: str = ""
+
+
+@dataclass
+class Simulation:
+    """一次下架试算的完整快照，确认时据此做乐观并发校验。"""
+
+    simulation_id: str
+    dataset_id: str
+    retired_versions: list[str]
+    draft_pairs: list[tuple[str, str]]
+    registered_pairs: list[tuple[str, str]]
+    protected_pairs: list[tuple[str, str]]
+    checks: list[PairCheck]
+    eligible: bool
+    reasons: list[str]
+    baseline_revision: int
+    baseline_active_versions: list[str]
+    baseline_registered_pairs: list[tuple[str, str]]
+
+
+class SimulationConflict(RuntimeError):
+    """试算快照与当前数据不一致，拒绝确认。"""
+
+    def __init__(self, message: str, details: list[str] | None = None):
+        self.details = details or []
+        super().__init__(message)
+
+
+def simulate_retirement(
+    dataset: Dataset,
+    dataset_id: str,
+    retire_versions: list[str],
+    draft_pairs: list[tuple[str, str]],
+) -> Simulation:
+    """试算下架方案，不修改数据集。
+
+    ``retire_versions`` 必须是当前在架版次；``draft_pairs`` 已由调用方
+    规范化。此前登记的月对会自动纳入本次试算。
+    """
+    retire = sorted(set(retire_versions))
+    unknown = [v for v in retire if v not in dataset.version_records]
+    if unknown:
+        raise ValueError(f"版次不存在于数据中：{'、'.join(unknown)}")
+    retired_already = [v for v in retire if v in dataset.retired_versions]
+    if retired_already:
+        raise ValueError(f"版次已下架，不能重复下架：{'、'.join(retired_already)}")
+
+    registered = list(dataset.protected_pairs)
+    # 新填月对若已登记，则视为已登记月对，避免重复检查
+    draft_unique = [p for p in dict.fromkeys(draft_pairs) if p not in registered]
+    pairs: list[tuple[str, str]] = list(registered)
+    sources: dict[tuple[str, str], str] = {p: PAIR_SOURCE_REGISTERED for p in registered}
+    for p in draft_unique:
+        pairs.append(p)
+        sources[p] = PAIR_SOURCE_DRAFT
+
+    baseline_edges = build_edges(_active_records(dataset))
+    remaining_edges = build_edges(_active_records(dataset, set(retire)))
+    remaining_active = [v for v in dataset.active_versions if v not in set(retire)]
+
+    checks: list[PairCheck] = []
+    reasons: list[str] = []
+    for pair in pairs:
+        start, end = pair
+        was_connected = _connected(baseline_edges, start, end)
+        path = _path_edges(remaining_edges, start, end)
+        connected = path is not None
+        check = PairCheck(
+            start_month=start,
+            end_month=end,
+            source=sources[pair],
+            was_connected=was_connected,
+            connected=connected,
+            disconnected_immediately=was_connected and not connected,
+        )
+        if connected:
+            check.path = _path_hops(path, start)
+            # 逐个版次模拟“整版源行临时取不到”，确认哪个版号是唯一支撑
+            for version in remaining_active:
+                alt = _path_edges(remaining_edges, start, end, {version})
+                if alt is None:
+                    check.bridge_versions.append(version)
+                    continue
+                check.alternate_paths[version] = _path_hops(alt, start)
+            if check.bridge_versions:
+                check.message = (
+                    f"下架后仍连通，但 {'、'.join(check.bridge_versions)} 的整版源行"
+                    "一旦临时取不到就会断开，缺少备用通路"
+                )
+                # 目标：余下任一版临时取不到时仍能换基，故单版依赖同样不能确认
+                reasons.append(f"{start} ↔ {end}：{check.message}")
+            else:
+                check.message = (
+                    "下架后仍连通，且余下任一版整版源行临时取不到时仍有替代通路"
+                )
+        else:
+            if was_connected:
+                check.message = "所选版次下架后立即断开，缺少备用通路"
+            elif start not in dataset.months or end not in dataset.months:
+                check.message = "月对中有月份不在已上传数据中，无法建立通路"
+            else:
+                check.message = "下架前该月对已不连通，无法建立通路"
+            reasons.append(f"{start} ↔ {end}：{check.message}")
+        checks.append(check)
+
+    if not retire and not draft_unique:
+        reasons.append("未选择下架版次，也未填写新的保护月对，方案为空")
+
+    return Simulation(
+        simulation_id=uuid.uuid4().hex,
+        dataset_id=dataset_id,
+        retired_versions=retire,
+        draft_pairs=draft_unique,
+        registered_pairs=registered,
+        protected_pairs=pairs,
+        checks=checks,
+        eligible=not reasons,
+        reasons=reasons,
+        baseline_revision=dataset.revision,
+        baseline_active_versions=list(dataset.active_versions),
+        baseline_registered_pairs=list(registered),
+    )
+
+
+def apply_simulation(dataset: Dataset, simulation: Simulation) -> None:
+    """按试算方案一次性写入；校验失败抛出 :class:`SimulationConflict`。
+
+    校验项：
+    * 试算方案中的每个保护月对在“当前在架版次 − 拟下架版次”下仍连通；
+    * 当前在架版次与已登记月对均与试算时一致（防止其他标签页并发修改）；
+    * 试算方案本身可确认（存在实际变更）。
+    任一项失败都不写入任何内容，现有供数保持不变。
+    """
+    if not simulation.eligible:
+        raise SimulationConflict(
+            "试算方案未通过，不能确认；请按提示调整后重新试算",
+            simulation.reasons,
+        )
+    current_active = list(dataset.active_versions)
+    current_registered = list(dataset.protected_pairs)
+    if (dataset.revision != simulation.baseline_revision
+            or current_active != simulation.baseline_active_versions
+            or current_registered != simulation.baseline_registered_pairs):
+        raise SimulationConflict(
+            "试算后数据集状态已变化（在架版次或已登记月对发生变动），"
+            "请重新试算后再确认",
+        )
+
+    # 用当前快照重新验证一次通路，确保确认结果与试算一致
+    remaining_edges = build_edges(_active_records(dataset, set(simulation.retired_versions)))
+    broken = [
+        f"{c.start_month} ↔ {c.end_month}"
+        for c in simulation.checks
+        if not _connected(remaining_edges, c.start_month, c.end_month)
+    ]
+    if broken:
+        raise SimulationConflict(
+            "试算结果已失效，下列月对不再连通，请重新试算",
+            broken,
+        )
+
+    # 全部校验通过后才写入；以下操作不会抛错
+    dataset.retired_versions |= set(simulation.retired_versions)
+    merged = list(dataset.protected_pairs)
+    for pair in simulation.draft_pairs:
+        if pair not in merged:
+            merged.append(pair)
+    dataset.protected_pairs = sorted(merged)
+    dataset.revision += 1

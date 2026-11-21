@@ -93,6 +93,45 @@
   .samples button { margin-right: 8px; margin-top: 6px; }
   .section-title { font-weight: 600; margin: 16px 0 8px; font-size: 14px; }
   .interval { font-variant-numeric: tabular-nums; }
+  .pair-editor { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  .pair-editor .field { display: flex; flex-direction: column; gap: 4px; }
+  .pair-editor label { font-size: 12.5px; color: var(--muted); }
+  .pair-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .pair-chip {
+    display: inline-flex; align-items: center; gap: 8px; background: #eef3fa;
+    border: 1px solid #c9d7e8; border-radius: 999px; padding: 4px 12px;
+    font-size: 13px; font-variant-numeric: tabular-nums;
+  }
+  .pair-chip.registered { background: #eafaf0; border-color: #a6e4c0; }
+  .pair-chip button {
+    background: transparent; color: #7a4a00; padding: 0 2px; font-size: 14px;
+    line-height: 1;
+  }
+  .pair-chip.registered button { display: none; }
+  .badge {
+    display: inline-block; border-radius: 6px; padding: 1px 8px;
+    font-size: 12px; font-weight: 600; white-space: nowrap;
+  }
+  .badge-ok { background: #dcf5e5; color: var(--rise); }
+  .badge-bad { background: #fde4e1; color: var(--fall); }
+  .badge-info { background: #eef2f7; color: #344054; }
+  .bridge-list { color: var(--warn); font-weight: 600; }
+  .path-line { font-size: 12.5px; color: #344054; margin-top: 4px; }
+  .path-line code { background: #eef2f7; padding: 1px 5px; border-radius: 4px; }
+  .sim-result { margin-top: 14px; }
+  .sim-banner {
+    border-radius: 8px; padding: 12px 16px; font-weight: 600; font-size: 14.5px;
+    margin-bottom: 12px;
+  }
+  .sim-ok { background: #eafaf0; border: 1px solid #a6e4c0; color: var(--rise); }
+  .sim-bad { background: #fef3f2; border: 1px solid #f2b8b5; color: var(--fall); }
+  .success-box {
+    background: #eafaf0; border: 1px solid #a6e4c0; color: #14532d;
+    border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-top: 10px;
+  }
+  .link-row { margin-top: 10px; font-size: 13px; }
+  .link-row a { color: var(--blue); }
+  .link-row button { padding: 4px 10px; font-size: 12.5px; }
 </style>
 </head>
 <body>
@@ -113,10 +152,12 @@
       <button class="secondary" data-sample="demo">示例：三版换基（可证实涨跌）</button>
       <button class="secondary" data-sample="conflict">示例：记录互相矛盾</button>
       <button class="secondary" data-sample="disconnected">示例：两月缺少换算关系</button>
+      <button class="secondary" data-sample="backup">示例：下架旧版后仍有备用通路</button>
     </div>
     <div id="uploadError" class="error-box hidden" style="margin-top:12px;"></div>
     <div id="uploadWarnings" class="warn-box hidden"></div>
     <div id="datasetMeta" class="hint" style="margin-top:10px;"></div>
+    <div id="datasetLink" class="link-row hidden"></div>
   </section>
 
   <section class="card hidden" id="configCard">
@@ -142,10 +183,54 @@
     <div id="verdictBanner"></div>
     <div id="resultBody"></div>
   </section>
+
+  <section class="card hidden" id="retireCard">
+    <h2>4. 下架试算（旧版次）</h2>
+    <p class="muted" style="margin-top:0;">
+      勾选拟下架的在架版次，填写需要继续保护的月对（也可以先只填月对、不选版次）。
+      试算会自动纳入此前已登记的月对：先核对每对在下架后是否仍连通（可借用中间月份），
+      再对仍连通的月对逐个检查“整版源行临时取不到”是否会使其断开。只有每个月的
+      通路都不依赖单一版次时才允许确认；确认会按本方案同时登记新月对并停用所选版次。
+    </p>
+    <div id="retireCurrent" class="hint"></div>
+
+    <div class="section-title">拟下架的版次（仅列当前在架版次）</div>
+    <div class="versions" id="retireVersionList"></div>
+
+    <div class="section-title">要保护的月对</div>
+    <div class="pair-editor">
+      <div class="field">
+        <label for="pairStart">月份 A</label>
+        <select id="pairStart"></select>
+      </div>
+      <div class="field">
+        <label for="pairEnd">月份 B</label>
+        <select id="pairEnd"></select>
+      </div>
+      <button id="addPairBtn" class="secondary">加入月对</button>
+    </div>
+    <div class="hint">每对必须选两个不同月份。月对无方向，A/B 颠倒视为同一对。</div>
+    <div class="pair-list" id="draftPairList"></div>
+    <div id="registeredPairs" class="pair-list"></div>
+
+    <div class="row" style="margin-top:16px;">
+      <button id="simulateBtn">下架试算</button>
+      <button id="confirmBtn" class="secondary" disabled>确认下架并登记月对</button>
+    </div>
+    <div class="hint" id="confirmHint">试算通过后才能确认。</div>
+    <div id="simError" class="error-box hidden" style="margin-top:12px;"></div>
+    <div id="simResult" class="sim-result"></div>
+    <div id="confirmResult" class="success-box hidden"></div>
+  </section>
 </main>
 
 <script>
-const state = { datasetId: null, dataset: null };
+const state = {
+  datasetId: null,
+  dataset: null,
+  draftPairs: [],       // 本次新填的月对，元素为 { start_month, end_month }
+  simulation: null,     // 最近一次试算结果
+};
 
 const $ = (id) => document.getElementById(id);
 
@@ -160,13 +245,74 @@ function escapeHtml(s) {
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 function verdictClass(v) { return 'verdict-banner verdict-' + v; }
+function pairKey(p) {
+  const [a, b] = [p.start_month, p.end_month].sort();
+  return a + '|' + b;
+}
+function pairText(pair) {
+  const [a, b] = pair;
+  return `${a} ↔ ${b}`;
+}
+function errorList(data, fallback) {
+  if (!data) return [fallback];
+  if (typeof data.detail === 'string') return [data.detail];
+  if (Array.isArray(data.detail?.errors)) return data.detail.errors;
+  if (data.detail && typeof data.detail.message === 'string') {
+    return [data.detail.message, ...(data.detail.details || [])];
+  }
+  if (Array.isArray(data.errors)) return data.errors;
+  return [data.detail ? JSON.stringify(data.detail) : fallback];
+}
 
-async function handleDatasetPayload(payload) {
+function syncDatasetUrl(datasetId) {
+  const url = new URL(window.location.href);
+  if (datasetId) url.searchParams.set('dataset', datasetId);
+  else url.searchParams.delete('dataset');
+  history.replaceState(null, '', url.toString());
+  const linkEl = $('datasetLink');
+  if (!datasetId) { linkEl.classList.add('hidden'); return; }
+  linkEl.classList.remove('hidden');
+  linkEl.innerHTML =
+    `数据集链接：<a href="?dataset=${encodeURIComponent(datasetId)}" target="_blank" rel="noopener">
+      在新标签页打开同一数据集</a>
+     <button class="secondary" id="refreshStateBtn" style="margin-left:10px;">刷新当前状态</button>`;
+  $('refreshStateBtn').addEventListener('click', () => refreshDatasetState(true));
+}
+
+async function refreshDatasetState(showFeedback, opts = {}) {
+  if (!state.datasetId) return null;
+  try {
+    const resp = await fetch(`/api/datasets/${encodeURIComponent(state.datasetId)}`);
+    const data = await resp.json();
+    if (!resp.ok) {
+      if (showFeedback) showError($('uploadError'), errorList(data, '数据集状态读取失败'));
+      return null;
+    }
+    handleDatasetPayload(data, { keepSimulation: true, keepErrors: opts.keepErrors });
+    if (showFeedback) {
+      $('confirmResult').classList.remove('hidden');
+      $('confirmResult').textContent = '已刷新为数据集当前状态。';
+    }
+    return data;
+  } catch (e) {
+    if (showFeedback) showError($('uploadError'), ['网络错误：' + e.message]);
+    return null;
+  }
+}
+
+async function handleDatasetPayload(payload, opts = {}) {
   state.datasetId = payload.dataset_id;
   state.dataset = payload;
+  if (!opts.keepSimulation) {
+    state.draftPairs = [];
+    state.simulation = null;
+  }
   hideError($('uploadError'));
+  if (!opts.keepErrors) hideError($('simError'));
+  $('confirmResult').classList.add('hidden');
   $('datasetMeta').textContent =
-    `已载入 ${payload.record_count} 条记录，覆盖 ${payload.months.length} 个月份、${payload.versions.length} 个版次。`;
+    `已载入 ${payload.record_count} 条记录，覆盖 ${payload.months.length} 个月份、`
+    + `${payload.versions.length} 个版次（在架 ${payload.active_versions.length} 个）。`;
   const warnEl = $('uploadWarnings');
   if (payload.warnings && payload.warnings.length) {
     warnEl.innerHTML = payload.warnings.map(escapeHtml).join('<br>');
@@ -174,10 +320,21 @@ async function handleDatasetPayload(payload) {
   } else {
     warnEl.classList.add('hidden');
   }
+  syncDatasetUrl(payload.dataset_id);
+  renderVersionList(payload);
+  renderMonthSelects(payload);
+  renderRetireSection(payload);
+  $('configCard').classList.remove('hidden');
+  $('retireCard').classList.remove('hidden');
+  if (!opts.keepSimulation) $('resultCard').classList.add('hidden');
+  invalidateSimulation();
+}
 
+function renderVersionList(payload) {
   const vl = $('versionList');
   vl.innerHTML = '';
-  payload.versions.forEach((v, idx) => {
+  const activeVersions = payload.versions.filter(v => v.active);
+  activeVersions.forEach((v, idx) => {
     const div = document.createElement('div');
     div.className = 'version-item';
     div.innerHTML = `
@@ -188,7 +345,18 @@ async function handleDatasetPayload(payload) {
       </label>`;
     vl.appendChild(div);
   });
+  if (!activeVersions.length) {
+    vl.innerHTML = '<div class="muted">当前没有在架版次可供判定。</div>';
+  }
+  const retired = payload.versions.filter(v => !v.active);
+  if (retired.length) {
+    vl.insertAdjacentHTML('beforeend',
+      `<div class="muted">已下架版次：${retired.map(v => escapeHtml(v.version)).join('、')}`
+      + '（仅保留源行供查询，不参与判定，也不能再勾选）。</div>');
+  }
+}
 
+function renderMonthSelects(payload) {
   const sm = $('startMonth'), em = $('endMonth');
   sm.innerHTML = ''; em.innerHTML = '';
   payload.months.forEach(m => {
@@ -199,9 +367,91 @@ async function handleDatasetPayload(payload) {
     sm.value = payload.months[0];
     em.value = payload.months[payload.months.length - 1];
   }
-  $('configCard').classList.remove('hidden');
-  $('resultCard').classList.add('hidden');
+  const ps = $('pairStart'), pe = $('pairEnd');
+  ps.innerHTML = ''; pe.innerHTML = '';
+  payload.months.forEach(m => {
+    ps.insertAdjacentHTML('beforeend', `<option value="${m}">${m}</option>`);
+    pe.insertAdjacentHTML('beforeend', `<option value="${m}">${m}</option>`);
+  });
+  if (payload.months.length >= 2) {
+    ps.value = payload.months[0];
+    pe.value = payload.months[1];
+  }
 }
+
+function renderRetireSection(payload) {
+  const active = new Set(payload.active_versions);
+  $('retireCurrent').textContent =
+    `当前在架版次：${payload.active_versions.join('、') || '（无）'}`
+    + `｜已下架：${payload.retired_versions.join('、') || '（无）'}`
+    + `｜已登记月对：${(payload.protected_pairs || []).length} 对`;
+
+  const list = $('retireVersionList');
+  list.innerHTML = '';
+  const candidates = payload.versions.filter(v => active.has(v.version));
+  if (!candidates.length) {
+    list.innerHTML = '<div class="muted">没有可下架的在架版次。</div>';
+  }
+  candidates.forEach((v, idx) => {
+    const div = document.createElement('div');
+    div.className = 'version-item';
+    div.innerHTML = `
+      <input type="checkbox" id="retire_${idx}" value="${escapeHtml(v.version)}">
+      <label for="retire_${idx}">
+        <strong>${escapeHtml(v.version)}</strong>
+        <span class="meta">基期月 ${escapeHtml(v.base_month)} · ${v.record_count} 条记录</span>
+      </label>`;
+    list.appendChild(div);
+    div.querySelector('input').addEventListener('change', invalidateSimulation);
+  });
+
+  renderPairChips();
+}
+
+function renderPairChips() {
+  const draftEl = $('draftPairList');
+  const regEl = $('registeredPairs');
+  draftEl.innerHTML = '';
+  regEl.innerHTML = '';
+  const registered = new Set((state.dataset?.protected_pairs || []).map(pairKey));
+  // 已由其他标签页登记过的月对不再重复展示为“本次新填”
+  state.draftPairs = state.draftPairs.filter(p => !registered.has(pairKey(p)));
+
+  state.draftPairs.forEach((p, idx) => {
+    const chip = document.createElement('span');
+    chip.className = 'pair-chip';
+    chip.innerHTML = `<span>${escapeHtml(pairText([p.start_month, p.end_month]))}</span>
+      <button title="移除" data-idx="${idx}">×</button>`;
+    chip.querySelector('button').addEventListener('click', () => {
+      state.draftPairs.splice(idx, 1);
+      renderPairChips();
+      invalidateSimulation();
+    });
+    draftEl.appendChild(chip);
+  });
+  if (!state.draftPairs.length) {
+    draftEl.innerHTML = '<span class="muted">本次尚未新填月对（也可以只勾选下架版次直接试算）。</span>';
+  }
+
+  const regs = state.dataset?.protected_pairs || [];
+  if (!regs.length) {
+    regEl.innerHTML = '<span class="muted">尚无已登记的保护月对。</span>';
+  }
+  regs.forEach(p => {
+    const chip = document.createElement('span');
+    chip.className = 'pair-chip registered';
+    chip.textContent = `${pairText([p.start_month, p.end_month])} · 已登记`;
+    regEl.appendChild(chip);
+  });
+}
+
+function invalidateSimulation() {
+  state.simulation = null;
+  $('confirmBtn').disabled = true;
+  $('confirmHint').textContent = '试算通过后才能确认。';
+  $('simResult').innerHTML = '';
+}
+
 
 $('uploadBtn').addEventListener('click', async () => {
   const f = $('fileInput').files[0];
@@ -309,6 +559,186 @@ function renderResult(res) {
   }
   body.innerHTML = html;
 }
+$('addPairBtn').addEventListener('click', () => {
+  const a = $('pairStart').value, b = $('pairEnd').value;
+  hideError($('simError'));
+  if (!a || !b) { showError($('simError'), ['请选择两个月份']); return; }
+  if (a === b) { showError($('simError'), ['一对月对必须选两个不同月份']); return; }
+  const normalized = a < b
+    ? { start_month: a, end_month: b }
+    : { start_month: b, end_month: a };
+  const key = pairKey(normalized);
+  const registered = (state.dataset?.protected_pairs || []).some(p => pairKey(p) === key);
+  if (registered) {
+    showError($('simError'), [`${pairText([a, b])} 已登记为保护月对，试算会自动纳入`]);
+    return;
+  }
+  if (state.draftPairs.some(p => pairKey(p) === key)) {
+    showError($('simError'), [`${pairText([a, b])} 已在本次待试算月对中`]);
+    return;
+  }
+  state.draftPairs.push(normalized);
+  renderPairChips();
+  invalidateSimulation();
+});
+
+$('simulateBtn').addEventListener('click', async () => {
+  hideError($('simError'));
+  hideError($('analyzeError'));
+  $('confirmResult').classList.add('hidden');
+  const retire = [...document.querySelectorAll('#retireVersionList input:checked')].map(i => i.value);
+  try {
+    const resp = await fetch(`/api/datasets/${encodeURIComponent(state.datasetId)}/simulate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ retire_versions: retire, pairs: state.draftPairs }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      const errors = errorList(data, '试算失败');
+      // 方案已过期（例如另一标签页刚下架了同一版次）：先拉取最新状态再显示原因
+      if (resp.status === 422 && state.datasetId) {
+        await refreshDatasetState(false, { keepErrors: true });
+      }
+      showError($('simError'), errors);
+      return;
+    }
+    state.simulation = data;
+    renderSimulation(data);
+  } catch (e) { showError($('simError'), ['网络错误：' + e.message]); }
+});
+
+$('confirmBtn').addEventListener('click', async () => {
+  if (!state.simulation) return;
+  hideError($('simError'));
+  $('confirmBtn').disabled = true;
+  try {
+    const resp = await fetch(`/api/datasets/${encodeURIComponent(state.datasetId)}/confirm`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ simulation_id: state.simulation.simulation_id }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      const errors = errorList(data, '确认失败');
+      // 另一个标签页可能已变更数据集；先拉取最新状态，避免刷新时清掉提示
+      if (resp.status === 409 && state.datasetId) {
+        await refreshDatasetState(false, { keepErrors: true });
+      }
+      showError($('simError'), errors);
+      $('confirmHint').textContent = '确认被拒绝；当前供数保持不变，请重新试算后再确认。';
+      $('simResult').innerHTML = '';
+      state.simulation = null;
+      return;
+    }
+    const retired = data.retired_versions.join('、') || '（无）';
+    const pairs = (data.protected_pairs || []).map(p => pairText([p.start_month, p.end_month])).join('、');
+    handleDatasetPayload(data);
+    const box = $('confirmResult');
+    box.classList.remove('hidden');
+    box.innerHTML = `已确认：下架版次 ${escapeHtml(retired)}；当前保护月对：${escapeHtml(pairs || '（无）')}。`
+      + ' 后续判定只会使用在架版次。';
+  } catch (e) {
+    showError($('simError'), ['网络错误：' + e.message]);
+    $('confirmBtn').disabled = !state.simulation;
+  }
+});
+
+function pathText(hops) {
+  if (!hops || !hops.length) return '<span class="muted">（无中间月份，直接记录）</span>';
+  return hops.map(h =>
+    `<code>${escapeHtml(h.from_month)}</code>→<code>${escapeHtml(h.to_month)}</code>`
+    + `（${escapeHtml(h.version)}，第 ${h.row_no} 行）`
+  ).join(' ｜ ');
+}
+
+function renderSimulation(sim) {
+  const box = $('simResult');
+  if (!sim.checks.length) {
+    box.innerHTML = '<div class="sim-banner sim-bad">方案为空：请勾选拟下架版次或填写保护月对。</div>';
+    $('confirmBtn').disabled = true;
+    $('confirmHint').textContent = '方案为空，无法确认。';
+    return;
+  }
+  let html = '';
+  if (sim.eligible) {
+    html += `<div class="sim-banner sim-ok">试算通过：${sim.checks.length} 个月对均有备用通路，可以确认。</div>`;
+  } else {
+    html += `<div class="sim-banner sim-bad">试算未通过：下列月对存在问题，不能确认。</div>`;
+    html += '<ul class="muted" style="margin-top:-4px;">'
+      + sim.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join('') + '</ul>';
+  }
+
+  html += `<p class="muted">拟下架：${sim.retire_versions.map(escapeHtml).join('、') || '（无）'}
+    ｜下架后剩余在架版次：${sim.remaining_active_versions.map(escapeHtml).join('、') || '（无）'}
+    ｜纳入试算月对：${sim.checks.length} 对（含已登记 ${sim.registered_pairs.length} 对）</p>`;
+
+  html += '<table><thead><tr><th>月对</th><th>来源</th><th>下架后状态</th>'
+    + '<th>整版缺失即断开的版号</th><th>可行通路</th></tr></thead><tbody>';
+  sim.checks.forEach(c => {
+    const pair = `${escapeHtml(c.start_month)} ↔ ${escapeHtml(c.end_month)}`;
+    const source = c.source === 'registered' ? '已登记' : '本次新填';
+    let statusBadge;
+    if (!c.connected) {
+      statusBadge = `<span class="badge badge-bad">${c.disconnected_immediately ? '下架后立即断开' : '不连通'}</span>`;
+    } else if (c.bridge_versions.length) {
+      statusBadge = '<span class="badge badge-bad">仍连通·无备用通路</span>';
+    } else {
+      statusBadge = '<span class="badge badge-ok">仍有备用通路</span>';
+    }
+    const bridges = c.bridge_versions.length
+      ? `<span class="bridge-list">${c.bridge_versions.map(escapeHtml).join('、')}</span>`
+      : '<span class="muted">—</span>';
+    const path = c.connected ? `<div class="path-line">${pathText(c.path)}</div>` : '<span class="muted">—</span>';
+    html += `<tr>
+      <td style="font-variant-numeric:tabular-nums;">${pair}</td>
+      <td>${source}</td>
+      <td>${statusBadge}<div class="muted">${escapeHtml(c.message)}</div></td>
+      <td>${bridges}</td>
+      <td>${path}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+
+  const connectedChecks = sim.checks.filter(c => c.connected);
+  if (connectedChecks.length) {
+    html += '<div class="section-title">备用通路核对：逐一排除余下版次后的通路</div>';
+    connectedChecks.forEach(c => {
+      html += `<div class="chain-step">
+        <strong>${escapeHtml(c.start_month)} ↔ ${escapeHtml(c.end_month)}</strong>
+        ｜下架后可行通路：<div class="path-line">${pathText(c.path)}</div>`;
+      const checked = Object.keys(c.alternate_paths).concat(c.bridge_versions);
+      checked.forEach(v => {
+        const alt = c.alternate_paths[v];
+        html += `<div class="path-line" style="margin-top:6px;">`;
+        if (alt) {
+          html += `若版号 <strong>${escapeHtml(v)}</strong> 整版源行临时取不到，仍可改走：${pathText(alt)}`;
+        } else {
+          html += `<span class="bridge-list">若版号 ${escapeHtml(v)} 整版源行临时取不到，该月对将断开（无替代通路）</span>`;
+        }
+        html += '</div>';
+      });
+      html += '</div>';
+    });
+  }
+
+  box.innerHTML = html;
+  $('confirmBtn').disabled = !sim.eligible;
+  $('confirmHint').textContent = sim.eligible
+    ? '确认将按本方案同时登记新月对并停用所选版次；若在架版次或已登记月对在试算后发生变化，将拒绝确认。'
+    : '存在无备用通路的月对，确认已禁用。请调整下架版次或月对后重新试算。';
+}
+
+async function loadDatasetFromUrl() {
+  const id = new URL(window.location.href).searchParams.get('dataset');
+  if (!id) return;
+  try {
+    const resp = await fetch(`/api/datasets/${encodeURIComponent(id)}`);
+    const data = await resp.json();
+    if (!resp.ok) { showError($('uploadError'), errorList(data, '数据集不存在或已过期，请重新上传')); return; }
+    handleDatasetPayload(data);
+  } catch (e) { showError($('uploadError'), ['网络错误：' + e.message]); }
+}
+
+loadDatasetFromUrl();
 </script>
 </body>
 </html>
